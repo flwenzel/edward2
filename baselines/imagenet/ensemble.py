@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Ensemble on CIFAR.
+"""Ensemble on ImageNet.
 
 This script only performs evaluation, not training. We recommend training
 ensembles by launching independent runs of `deterministic.py` over different
@@ -24,19 +24,17 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-import functools
 import os
-
 
 from absl import app
 from absl import flags
 from absl import logging
 
 import edward2 as ed
+import deterministic_model  # local file import
 import utils  # local file import
 
 import tensorflow.compat.v2 as tf
-import tensorflow_datasets as tfds
 
 # TODO(trandustin): We inherit
 # FLAGS.{dataset,per_core_batch_size,output_dir,seed} from deterministic. This
@@ -44,97 +42,7 @@ import tensorflow_datasets as tfds
 # from a binary or duplicate the model definition here.
 flags.mark_flag_as_required('output_dir')
 FLAGS = flags.FLAGS
-
-
-def resnet_layer_old(inputs,
-                     filters,
-                     kernel_size=3,
-                     strides=1,
-                     activation=None,
-                     l2=0.):
-  """2D Convolution-Batch Normalization-Activation stack builder.
-
-  Args:
-    inputs: tf.Tensor.
-    filters: Number of filters for Conv2D.
-    kernel_size: Kernel dimensions for Conv2D.
-    strides: Stride dimensinons for Conv2D.
-    activation: tf.keras.activations.Activation.
-    l2: L2 regularization coefficient.
-
-  Returns:
-    tf.Tensor.
-  """
-  x = inputs
-  logging.info('Applying conv layer.')
-  x = tf.keras.layers.Conv2D(
-      filters,
-      kernel_size=kernel_size,
-      strides=strides,
-      padding='same',
-      kernel_initializer='he_normal',
-      kernel_regularizer=tf.keras.regularizers.l2(l2),
-      bias_regularizer=tf.keras.regularizers.l2(l2))(
-          x)
-  x = tf.keras.layers.BatchNormalization(epsilon=1e-5, momentum=0.9)(x)
-  if activation is not None:
-    x = tf.keras.layers.Activation(activation)(x)
-  return x
-
-
-def resnet_v1(input_shape, depth, width_multiplier, num_classes, l2):
-  """Builds ResNet v1.
-
-  Args:
-    input_shape: tf.Tensor.
-    depth: ResNet depth.
-    width_multiplier: Integer to multiply the number of typical filters by.
-    num_classes: Number of output classes.
-    l2: L2 regularization coefficient.
-
-  Returns:
-    tf.keras.Model.
-  """
-  num_res_blocks = (depth - 2) // 6
-  filters = 16 * width_multiplier
-  if (depth - 2) % 6 != 0:
-    raise ValueError('depth must be 6n+2 (e.g. 20, 32, 44).')
-
-  logging.info('Starting ResNet build.')
-  inputs = tf.keras.layers.Input(shape=input_shape)
-  x = resnet_layer_old(inputs, filters=filters, activation='relu', l2=l2)
-  for stack in range(3):
-    for res_block in range(num_res_blocks):
-      logging.info('Starting ResNet stack #%d block #%d.', stack, res_block)
-      strides = 1
-      if stack > 0 and res_block == 0:  # first layer but not first stack
-        strides = 2  # downsample
-      y = resnet_layer_old(
-          x, filters=filters, strides=strides, activation='relu', l2=l2)
-      y = resnet_layer_old(y, filters=filters, activation=None, l2=l2)
-      if stack > 0 and res_block == 0:  # first layer but not first stack
-        # linear projection residual shortcut connection to match changed dims
-        x = resnet_layer_old(
-            x,
-            filters=filters,
-            kernel_size=1,
-            strides=strides,
-            activation=None,
-            l2=l2)
-      x = tf.keras.layers.add([x, y])
-      x = tf.keras.layers.Activation('relu')(x)
-    filters *= 2
-
-  # v1 does not use BN after last shortcut connection-ReLU
-  x = tf.keras.layers.AveragePooling2D(pool_size=8)(x)
-  x = tf.keras.layers.Flatten()(x)
-  x = tf.keras.layers.Dense(
-      num_classes,
-      kernel_initializer='he_normal',
-      kernel_regularizer=tf.keras.regularizers.l2(l2),
-      bias_regularizer=tf.keras.regularizers.l2(l2))(
-          x)
-  return tf.keras.models.Model(inputs=inputs, outputs=x)
+NUM_CLASSES = 1000
 
 
 def ensemble_negative_log_likelihood(labels, logits):
@@ -197,30 +105,17 @@ def main(argv):
   tf.enable_v2_behavior()
   tf.random.set_seed(FLAGS.seed)
 
-  # TODO(trandustin): Replace with load_input_fn.
-  ds_info = tfds.builder(FLAGS.dataset).info
+  # TODO(trandustin): Replace with load_distributed_dataset. Currently hangs.
 
-  dataset_input_fn = utils.load_input_fn(
-      tfds.Split.TEST,
-      FLAGS.per_core_batch_size,
-      name=FLAGS.dataset,
-      use_bfloat16=False,
-      normalize=True,
-      drop_remainder=True,
-      proportion=1.0)
-  dataset_test = dataset_input_fn()
-  # model = deterministic.wide_resnet(
-  #     input_shape=ds_info.features['image'].shape,
-  #     depth=28,
-  #     width_multiplier=5,
-  #     num_classes=ds_info.features['label'].num_classes,
-  #     l2=0.,
-  #     version=2)
-  model = resnet_v1(input_shape=(32, 32, 3),
-                    depth=14,
-                    num_classes=ds_info.features['label'].num_classes,
-                    width_multiplier=4,
-                    l2=0.)
+  dataset_test = utils.ImageNetInput(
+      is_training=False,
+      data_dir=FLAGS.data_dir,  # TODO(ghassen) : check data_dir
+      batch_size=FLAGS.per_core_batch_size,
+      use_bfloat16=False).input_fn()
+
+  model = deterministic_model.resnet50(input_shape=(224, 224, 3),
+                                       num_classes=NUM_CLASSES)
+
   logging.info('Model input shape: %s', model.input_shape)
   logging.info('Model output shape: %s', model.output_shape)
   logging.info('Model number of weights: %s', model.count_params())
@@ -229,6 +124,7 @@ def main(argv):
   ensemble_filenames = tf.io.gfile.glob(os.path.join(FLAGS.output_dir,
                                                      '**/*.index'))
   ensemble_filenames = [filename[:-6] for filename in ensemble_filenames]
+  logging.info('ensemble_filenames: %s', ensemble_filenames)
   ensemble_size = len(ensemble_filenames)
   logging.info('Ensemble size: %s', ensemble_size)
   logging.info('Ensemble number of weights: %s',
@@ -236,35 +132,27 @@ def main(argv):
   logging.info('Ensemble filenames: %s', str(ensemble_filenames))
   checkpoint = tf.train.Checkpoint(model=model)
 
-  # Collect the logits output for each ensemble member and train/test data
+  # Collect the logits output for each ensemble member and test data
   # point. We also collect the labels.
-  # TODO(trandustin): Refactor data loader so you can get the full dataset in
-  # memory without looping.
 
   test_datasets = {
       'clean': dataset_test,
   }
   logits_test = {'clean': []}
   labels_test = {'clean': []}
-  corruption_types, max_intensity = utils.load_corrupted_test_info(
-      FLAGS.dataset)
+  corruption_types, max_intensity = utils.load_corrupted_test_info()
   for name in corruption_types:
     for intensity in range(1, max_intensity + 1):
       dataset_name = '{0}_{1}'.format(name, intensity)
       logits_test[dataset_name] = []
       labels_test[dataset_name] = []
 
-      if FLAGS.dataset == 'cifar10':
-        load_c_dataset = utils.load_cifar10_c_input_fn
-      else:
-        load_c_dataset = functools.partial(utils.load_cifar100_c_input_fn,
-                                           path=FLAGS.cifar100_c_path)
-      corrupted_input_fn = load_c_dataset(
-          corruption_name=name,
-          corruption_intensity=intensity,
+      test_datasets[dataset_name] = utils.load_corrupted_test_dataset(
+          name=name,
+          intensity=intensity,
           batch_size=FLAGS.per_core_batch_size,
+          drop_remainder=True,
           use_bfloat16=False)
-      test_datasets[dataset_name] = corrupted_input_fn()
 
   for m, ensemble_filename in enumerate(ensemble_filenames):
     checkpoint.restore(ensemble_filename)
@@ -283,20 +171,16 @@ def main(argv):
       logging.info('Finished testing on %s', format(name))
       print('Finished testing on {}'.format(name))
 
-  if FLAGS.dataset == 'cifar10':
-    num_classes = 10
-  else:
-    num_classes = 100
   metrics = {
       'ece':
           ed.metrics.ExpectedCalibrationError(
-              num_classes=num_classes, num_bins=15)
+              num_classes=NUM_CLASSES, num_bins=15)
   }
   corrupt_metrics = {}
   for name in test_datasets:
     corrupt_metrics['test/ece_{}'.format(
         name)] = ed.metrics.ExpectedCalibrationError(
-            num_classes=num_classes, num_bins=15)
+            num_classes=NUM_CLASSES, num_bins=15)
     corrupt_metrics['test/nll_{}'.format(name)] = tf.keras.metrics.Mean()
     corrupt_metrics['test/acc_{}'.format(name)] = tf.keras.metrics.Mean()
 
